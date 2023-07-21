@@ -14,6 +14,7 @@ use std::{
     io::{Read, Seek},
 };
 use tss_esapi::structures::PcrSlot;
+use std::process::Command;
 
 #[derive(Deserialize)]
 pub struct Ident {
@@ -129,6 +130,25 @@ pub async fn identity(
     let response = JsonWrapper::success(quote);
     info!("GET identity quote returning 200 response");
     HttpResponse::Ok().json(response)
+}
+
+fn ima_ns_id_mapping(container_id: &str) -> (String, String) {
+    let script_file = "../../scripts/ima_ns_id_mapping.sh";
+    let output = Command::new("bash").arg(script_file).arg(container_id).output().expect("failed to execute process");
+
+    let out = output.stdout;
+    let string = String::from_utf8(out).expect("Found invalid UTF-8");
+    
+    let mut line_vect: Vec<&str> = string.split("\n").collect();
+    let ima_id = line_vect.remove(0);
+    let mes_list_ns: String = line_vect.join("\n");
+
+    if output.status.success() {
+        (String::from(ima_id), String::from(mes_list_ns))
+    } else {
+        
+        (String::from("error"), String::from("error"))
+    }
 }
 
 // This is a Quote request from the cloud verifier, which will check
