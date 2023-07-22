@@ -674,6 +674,9 @@ async fn main() -> Result<()> {
                                 .service(web::resource("/integrity").route(
                                     web::get().to(quotes_handler::integrity),
                                 ))
+                                .service(web::resource("/container").route(
+                                    web::get().to(quotes_handler::integrity_container),
+                                ))
                                 .default_service(web::to(
                                     errors_handler::quotes_default,
                                 )),

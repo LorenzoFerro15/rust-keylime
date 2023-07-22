@@ -27,6 +27,7 @@ pub struct Integ {
     mask: String,
     partial: String,
     ima_ml_entry: Option<String>,
+    containerid: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -43,6 +44,10 @@ pub(crate) struct KeylimeQuote {
     pub mb_measurement_list: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ima_measurement_list_entry: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ima_namespace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ima_measurement_list_namespace: Option<String>,
 }
 
 // This is a Quote request from the tenant, which does not check
@@ -132,7 +137,7 @@ pub async fn identity(
     HttpResponse::Ok().json(response)
 }
 
-fn ima_ns_id_mapping(container_id: &str) -> (String, String) {
+fn ima_ns_id_mapping(container_id: String) -> (String, String) {
     let script_file = "../../scripts/ima_ns_id_mapping.sh";
     let output = Command::new("bash").arg(script_file).arg(container_id).output().expect("failed to execute process");
 
@@ -149,6 +154,232 @@ fn ima_ns_id_mapping(container_id: &str) -> (String, String) {
         
         (String::from("error"), String::from("error"))
     }
+}
+
+pub async fn integrity_container(
+    req: HttpRequest,
+    param: web::Query<Integ>,
+    data: web::Data<QuoteData>,
+) -> impl Responder {
+    if !param.nonce.chars().all(char::is_alphanumeric) {
+        warn!("Get quote returning 400 response. Parameters should be strictly alphanumeric: {}", param.nonce);
+        return HttpResponse::BadRequest().json(JsonWrapper::error(
+            400,
+            format!("nonce should be strictly alphanumeric: {}", param.nonce),
+        ));
+    }
+
+    if !param.mask.chars().all(char::is_alphanumeric) {
+        warn!("Get quote returning 400 response. Parameters should be strictly alphanumeric: {}", param.mask);
+        return HttpResponse::BadRequest().json(JsonWrapper::error(
+            400,
+            format!("mask should be strictly alphanumeric: {}", param.mask),
+        ));
+    }
+
+    let mask = match u32::from_str_radix(param.mask.trim_start_matches("0x"), 16) {
+            Ok(mask) => mask,
+            Err(e) => {
+                return HttpResponse::BadRequest().json(JsonWrapper::error(
+                    400,
+                    format!(
+                        "mask should be a hex encoded 32-bit integer: {}",
+                        param.mask
+                    ),
+                ));
+            }
+        };
+
+    if param.nonce.len() > tpm::MAX_NONCE_SIZE {
+        warn!("Get quote returning 400 response. Nonce is too long (max size {}): {}",
+                tpm::MAX_NONCE_SIZE,
+                param.nonce.len()
+        );
+        return HttpResponse::BadRequest().json(JsonWrapper::error(
+            400,
+            format!(
+                "Nonce is too long (max size: {}): {}",
+                tpm::MAX_NONCE_SIZE,
+                param.nonce.len()
+            ),
+        ));
+    }
+    if param.containerid.is_none() {
+        warn!("Get quote returning 400 response. Not found the container identifier as parameter",
+        );
+        return HttpResponse::BadRequest().json(JsonWrapper::error(
+            400,
+            format!(
+                "Not found the container identifier as parameter "
+            ),
+        ));
+    }
+    let mut container_identifier: String = param.containerid.clone().unwrap(); 
+    if !container_identifier.chars().all(char::is_alphanumeric) {
+        warn!("Get quote returning 400 response. Parameters should be strictly alphanumeric: {}", param.mask);
+        return HttpResponse::BadRequest().json(JsonWrapper::error(
+            400,
+            format!("mask should be strictly alphanumeric: {}", param.mask),
+        ));
+    }
+
+    let pubkey = match &param.partial[..] {
+        "0" => {
+            let pubkey = match crypto::pkey_pub_to_pem(&data.pub_key) {
+                Ok(pubkey) => pubkey,
+                Err(e) => {
+                    debug!("Unable to retrieve public key: {:?}", e);
+                    return HttpResponse::InternalServerError().json(
+                        JsonWrapper::error(
+                            500,
+                            "Unable to retrieve public key".to_string(),
+                        ),
+                    );
+                }
+            };
+            Some(pubkey)
+        }
+        "1" => None,
+        _ => {
+            warn!("Get quote returning 400 response. uri must contain key 'partial' and value '0' or '1'");
+            return HttpResponse::BadRequest().json(JsonWrapper::error(
+                400,
+                "uri must contain key 'partial' and value '0' or '1'"
+                    .to_string(),
+            ));
+        }
+    };
+
+    debug!(
+        "Calling Integrity Quote with nonce: {}, mask: {}",
+        param.nonce, param.mask
+    );
+    
+     // If an index was provided, the request is for the entries starting from the given index
+    // (iterative attestation). Otherwise the request is for the whole list.
+    let nth_entry = match &param.ima_ml_entry {
+        None => 0,
+        Some(idx) => idx.parse::<u64>().unwrap_or(0),
+    };
+
+
+    // must unwrap here due to lock mechanism
+    // https://github.com/rust-lang-nursery/failure/issues/192
+    let mut context = data.tpmcontext.lock().unwrap(); //#[allow_ci]
+
+    let tpm_quote = match context.quote(
+        param.nonce.as_bytes(),
+        mask,
+        &data.pub_key,
+        data.ak_handle,
+        data.hash_alg,
+        data.sign_alg,
+    ) {
+        Ok(tpm_quote) => tpm_quote,
+        Err(e) => {
+            debug!("Unable to retrieve quote: {:?}", e);
+            return HttpResponse::InternalServerError().json(
+                JsonWrapper::error(
+                    500,
+                    "Unable to retrieve quote".to_string(),
+                ),
+            );
+        }
+    };
+
+    let id_quote = KeylimeQuote {
+        quote: tpm_quote,
+        hash_alg: data.hash_alg.to_string(),
+        enc_alg: data.enc_alg.to_string(),
+        sign_alg: data.sign_alg.to_string(),
+        ..Default::default()
+    };
+
+    let mut mb_measurement_list = None;
+    match tpm::check_mask(mask, &PcrSlot::Slot0) {
+        Ok(true) => {
+            if let Some(measuredboot_ml_file) = &data.measuredboot_ml_file {
+                let mut ml = Vec::<u8>::new();
+                let mut f = measuredboot_ml_file.lock().unwrap(); //#[allow_ci]
+                if let Err(e) = f.rewind() {
+                    debug!("Failed to rewind measured boot file: {}", e);
+                    return HttpResponse::InternalServerError().json(
+                        JsonWrapper::error(
+                            500,
+                            "Unable to retrieve quote".to_string(),
+                        ),
+                    );
+                }
+                mb_measurement_list = match f.read_to_end(&mut ml) {
+                    Ok(_) => Some(general_purpose::STANDARD.encode(ml)),
+                    Err(e) => {
+                        warn!("Could not read TPM2 event log: {}", e);
+                        None
+                    }
+                };
+            }
+        }
+        Err(e) => {
+            debug!("Unable to check PCR mask: {:?}", e);
+            return HttpResponse::InternalServerError().json(
+                JsonWrapper::error(
+                    500,
+                    "Unable to retrieve quote".to_string(),
+                ),
+            );
+        }
+        _ => (),
+    }
+
+    // Generate the measurement list
+    let (ima_measurement_list, ima_measurement_list_entry, num_entries) =
+        if let Some(ima_file) = &data.ima_ml_file {
+            let mut ima_ml = data.ima_ml.lock().unwrap(); //#[allow_ci]
+            match ima_ml.read(
+                &mut ima_file.lock().unwrap(), //#[allow_ci]
+                nth_entry,
+            ) {
+                Ok(result) => {
+                    (Some(result.0), Some(result.1), Some(result.2))
+                }
+                Err(e) => {
+                    debug!("Unable to read measurement list: {:?}", e);
+                    return HttpResponse::InternalServerError().json(
+                        JsonWrapper::error(
+                            500,
+                            "Unable to retrieve quote".to_string(),
+                        ),
+                    );
+                }
+            }
+        } else {
+            (None, None, None)
+        };
+
+    let mut ima_namespace_id: Option<String> = None;
+    let mut ima_measurement_list_namespace: Option<String> = None;
+    
+    let (ima_id, ima_ns_list) = ima_ns_id_mapping(container_identifier);
+
+    if ima_ns_list == String::from("error") && ima_id == String::from("error") {
+        ima_namespace_id = Some((ima_id));
+        ima_measurement_list_namespace = Some((ima_ns_list))
+    }
+    // Generate the final quote based on the ID quote
+    let quote = KeylimeQuote {
+        pubkey,
+        ima_measurement_list,
+        mb_measurement_list,
+        ima_measurement_list_entry,
+        ima_namespace_id,
+        ima_measurement_list_namespace,
+        ..id_quote
+    };
+
+    let response = JsonWrapper::success(quote);
+    info!("GET integrity quote returning 200 response");
+    HttpResponse::Ok().json(response)
+
 }
 
 // This is a Quote request from the cloud verifier, which will check
